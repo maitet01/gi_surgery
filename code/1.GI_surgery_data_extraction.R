@@ -29,6 +29,16 @@ library(stringr)    # For string operations
 # data_path <- "data/smrs_data.csv"
 # output_path <- "output/gi_surgeries.csv"
 
+####################
+## Lookups        ##
+####################
+
+simd_lookup <- read_csv("/conf/linkage/output/lookups/Unicode/Deprivation/postcode_2024_2_simd2020v2.csv") %>% 
+  select(pc8, simd2020v2_sc_quintile) %>% 
+  mutate(pc8 = str_remove_all(pc8, " ")) %>% 
+  rename(postcode = pc8)
+
+
 # 3. Define codes for GI surgery
 
 gi_codes_upper <- read_excel("data/20250312 OPCS4 GI CODES.xlsx", 
@@ -39,11 +49,25 @@ gi_codes_upper <- read_excel("data/20250312 OPCS4 GI CODES.xlsx",
 
 
 # First and last dates of procedures to include
-first_admission_date = ymd("2024-01-01")
+first_admission_date = ymd("2023-01-01")
 last_admission_date = ymd("2024-12-31")
 
 
 #gi_code_list <- unlist(procedure_list)
+
+# Specifies the procedures to get a count for
+procedure_list =
+  list(
+    "upper GI procedures" = gi_codes_upper$opcs_codes
+  )
+
+
+# # Add a total category
+# procedure_list[["Any"]] = sort(unlist(procedure_list, use.names = FALSE))
+
+# Include only procedures where this condition is listed
+condition_filter = "E66"
+
 
 
 
@@ -84,48 +108,29 @@ dbDisconnect(channel)
 
 # Select the cases with GI surgery ----------------------------------------
 
-# Check that there are not duplicated columns
+# Need to translate health board code definitions later
+# Chose not to use phsmethods::match_area() because I want to specify the expected areas,
+# and phsmethods can't be used to list the areas of a given type
+hb_def_url = "https://www.opendata.nhs.scot/dataset/9f942fdb-e59e-44f5-b534-d6e17229cc7b/resource/652ff726-e676-4a20-abda-435b98dd7bdc/download/hb14_hb19.csv"
+hb_def = read.csv(hb_def_url, stringsAsFactors = FALSE)
 
-names(smr1_return[duplicated(names(smr1_return))])
+# Add codes missing from the open data list
+extra_def =
+  data.frame(HB = c("S08100001","S27000001","S27000002"),
+             HBName = c("Golden Jubilee","Non-NHS Provider", "Not Applicable"),
+             stringsAsFactors = FALSE)
 
-#If there are any duplicated columns that no needed remove
+# Convert to a general list of locations including Scotland
+loc_def =
+  bind_rows(hb_def, extra_def) %>%
+  select(HB, HBName) %>%
+  rename(loc_code = HB, location = HBName) %>%
+  add_row(loc_code = "S92000003", location = "Scotland")
 
-library(dplyr)
+data = clean_names(smr1_return)
 
-# Get unique column names
-unique_names <- names(smr1_return)[!duplicated(names(smr1_return))]
+#data_original <- data
 
-# Select only those columns
-smr1_return <- smr1_return %>%
-  select(all_of(unique_names))
-
-## Select the cases with GI surgery
-
-
-gi_surgery_cases <- smr1_return %>%
-  filter(
-    MAIN_OPERATION %in% gi_codes_upper$opcs_codes |
-      OTHER_OPERATION_1 %in% gi_codes_upper$opcs_codes |
-      OTHER_OPERATION_2 %in% gi_codes_upper$opcs_codes |
-      OTHER_OPERATION_3 %in% gi_codes_upper$opcs_codes
-  )
-
-## Number of surgeries accross all the operations:
-### Combine all operation columns into one long column:
-
-gi_surgery_long <- gi_surgery_cases %>% 
-  select(MAIN_OPERATION, OTHER_OPERATION_1, OTHER_OPERATION_2, OTHER_OPERATION_3) %>% 
-  pivot_longer(cols = everything(), names_to = "operation_type", values_to = "opcs_code") %>% 
-  filter(!is.na(opcs_code))
-
-#Count frequency of each code:
-gi_surgery_summary2 <- gi_surgery_long %>% 
-  filter(opcs_code %in% gi_codes_upper$opcs_codes) %>% 
-  count(opcs_code, sort = TRUE)
-
-
-
-# Create a Pivot table specification --------------------------------------
 
 # Need to pivot longer to filter each operation by its date later
 # But we need to pivot in matching pairs of columns (main_operation with
@@ -148,10 +153,27 @@ df_spec = data.frame(
   # Will get odd errors about mis-matching types without this
   stringsAsFactors = FALSE)
 
-data = pivot_longer_spec(smr1_return, df_spec, values_drop_na = TRUE)
+data = pivot_longer_spec(data, df_spec, values_drop_na = TRUE)
 
 data["op_year"] = year(data[["op_date"]]) # Calendar year required for this IR
 
 data = left_join(data, loc_def, by = c("hbtreat_currentdate" = "loc_code"))
 
-test 2
+#
+# Analyse data ----
+#
+
+
+# First filter to data that matches our criteria
+
+cond_filter_reg = paste0("^(", paste(condition_filter, collapse = "|"), ")")
+# Not sure if any codes can be in the B position, but accept them if they are
+proc_filter_reg = paste0("(", paste(procedure_list[["Any"]], collapse = "|"), ")")
+
+data_filtered =
+  data %>%
+  filter(op_date %within% interval(first_admission_date, last_admission_date)) %>%
+  filter(if_any(contains("condition"), ~str_detect(., cond_filter_reg))) %>%
+  filter(str_detect(op_code, proc_filter_reg))
+
+
